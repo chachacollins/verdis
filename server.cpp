@@ -6,19 +6,76 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <cassert>
 
-static void do_something(int connfd)
+static int read_all(int fd, char *buf, size_t n)
 {
-    char rbuf[64] = {};
-    ssize_t n = read(connfd, rbuf, sizeof(rbuf) - 1);
-    if(n < 0)
+    while(n > 0)
     {
-        std::cerr << "read error\n";
-        return;
+        ssize_t rv = read(fd, buf, n);
+        if(rv <= 0)
+        {
+            if(errno == EINTR) continue;
+            return -1;
+        }
+        assert((size_t)rv <= n);
+        n -= (size_t)rv;
+        buf += rv;
     }
-    std::cout << "Client says: " << rbuf << "\n";
-    char wbuf[] = "World";
-    write(connfd, wbuf, strlen(wbuf));
+    return 0;
+}
+
+static int write_all(int fd, char *buf, size_t n)
+{
+    while(n > 0)
+    {
+        ssize_t rv = write(fd, buf, n);
+        if(rv <= 0) return -1;
+        assert((size_t)rv <= n);
+        n -= (size_t)rv;
+        buf += rv;
+    }
+    return 0;
+}
+
+constexpr size_t k_max_msg = 4096;
+
+static int one_request(int connfd)
+{
+    char rbuf[4 + k_max_msg];
+    errno = 0;
+    int err = read_all(connfd, rbuf, 4);
+    if(err)
+    {
+        if(errno == 0)
+            std::cerr << "ERROR: EOF\n";
+        else
+            std::cerr << "ERROR: could not read from socket: " 
+                      << strerror(errno) 
+                      << "\n";
+        return err;
+    }
+    unsigned int len = 0;
+    memcpy(&len, rbuf, sizeof(unsigned int)); // assume little endian
+    if(len > k_max_msg)
+    {
+        std::cerr << "ERROR: message too long\n";
+        return 1;
+    }
+    err = read_all(connfd, &rbuf[4], len);
+    if(err)
+    {
+        std::cerr << "ERROR: could not read message\n";
+        return 1;
+    }
+    printf("client says: %.*s\n", len, &rbuf[4]);
+
+    const char reply[] = "world";
+    char wbuf[4 + sizeof(reply)];
+    len = (unsigned int)strlen(reply);
+    memcpy(wbuf, &len, sizeof(unsigned int));
+    memcpy(&wbuf[4], reply, len);
+    return write_all(connfd, wbuf, 4 + len);
 }
 
 int main(void)
@@ -75,8 +132,11 @@ int main(void)
                       << "\n";
             continue;
         }
-        do_something(connfd);
-        std::cout << "Accepted connection: " << connfd << "\n";
+        while(true)
+        {
+            int err = one_request(connfd);
+            if(err) break;
+        }
         close(connfd);
     }
     close(fd);
