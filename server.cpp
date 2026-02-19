@@ -7,75 +7,201 @@
 #include <sys/socket.h>
 #include <netinet/ip.h>
 #include <cassert>
+#include <poll.h>
+#include <vector>
+#include <fcntl.h>
+#include <map>
 
-static int read_all(int fd, char *buf, size_t n)
+struct Conn
 {
-    while(n > 0)
+    int fd = -1;
+    bool want_read  = false;
+    bool want_write = false;
+    bool want_close = false;
+    std::vector<uint8_t> incoming;
+    std::vector<uint8_t> outgoing;
+};
+
+static void fd_set_nb(int fd)
+{
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+}
+
+constexpr size_t k_max_msg = 32 << 20;
+
+static void buf_append(std::vector<uint8_t> &buf, const uint8_t *data, size_t len)
+{
+    buf.insert(buf.end(), data, data+len);
+}
+
+static void buf_consume(std::vector<uint8_t> &buf, size_t n)
+{
+    buf.erase(buf.begin(), buf.begin()+n);
+}
+
+static bool read_u32(const uint8_t *&cur, const uint8_t *end, uint32_t &out)
+{
+    if (cur + 4 > end) return false;
+    memcpy(&out, cur, 4);
+    cur += 4;
+    return true;
+}
+
+static bool
+read_str(const uint8_t *&cur, const uint8_t *end, size_t n, std::string &out)
+{
+    if (cur + n > end) return false;
+    out.assign(cur, cur + n);
+    cur += n;
+    return true;
+}
+enum 
+{
+    RES_OK = 0,
+    RES_ERR = 1,
+    RES_NX = 2,
+};
+
+struct Response
+{
+    unsigned int status = 0;
+    std::vector<uint8_t> data;
+};
+
+static std::map<std::string, std::string> g_data;
+
+static void
+do_request(std::vector<std::string> &cmd, Response &out)
+{
+    if(cmd.size() == 2 && cmd[0] == "get")
     {
-        ssize_t rv = read(fd, buf, n);
-        if(rv <= 0)
+        auto it = g_data.find(cmd[1]);
+        if(it == g_data.end())
         {
-            if(errno == EINTR) continue;
-            return -1;
+            out.status = RES_NX;
+            return;
         }
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        buf += rv;
+        const std::string &val = it->second;
+        out.data.assign(val.begin(), val.end());
     }
+    else if(cmd.size() == 3 && cmd[0] == "set")
+    {
+        g_data[cmd[1]].swap(cmd[2]);
+    }
+    else if(cmd.size() == 2 && cmd[0] == "del")
+    {
+        g_data.erase(cmd[1]);
+    }
+    else
+    {
+        out.status = RES_ERR;
+    }
+}
+
+static void 
+make_response(const Response &resp, std::vector<uint8_t> &out)
+{
+    uint32_t resp_len = 4 + (uint32_t)resp.data.size();
+    buf_append(out, (const uint8_t *)&resp_len, 4);
+    buf_append(out, (const uint8_t *)&resp.status, 4);
+    buf_append(out, resp.data.data(), resp.data.size());
+}
+
+static int 
+parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out)
+{
+    const uint8_t *end = data + size;
+    unsigned int nstr = 0;
+    if(!read_u32(data, end, nstr)) return -1;
+    if(nstr > k_max_msg) return -1;
+    while(out.size() < nstr)
+    {
+        unsigned len = 0;
+        if(!read_u32(data, end, len)) return -1;
+        out.push_back(std::string());
+        if(!read_str(data, end, len, out.back())) return -1;
+    }
+    if(data != end) return -1;
     return 0;
 }
 
-static int write_all(int fd, char *buf, size_t n)
+static bool try_one_request(Conn *conn)
 {
-    while(n > 0)
+    if(conn->incoming.size() < 4)
     {
-        ssize_t rv = write(fd, buf, n);
-        if(rv <= 0) return -1;
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        buf += rv;
+        return false;
     }
-    return 0;
+    int len = 0;
+    memcpy(&len, conn->incoming.data(), 4);
+    if(len > (int)k_max_msg)
+    {
+        conn->want_close = true;
+        return false;
+    }
+    if(4 + len > (int)conn->incoming.size()) return false;
+    const uint8_t *request = &conn->incoming[4];
+    buf_consume(conn->incoming, 4 + len);
+    std::vector<std::string> cmd;
+    if(parse_req(request, len, cmd) < 0)
+    {
+        conn->want_close = true;
+        return false;
+    }
+    Response resp;
+    do_request(cmd, resp);
+    make_response(resp, conn->outgoing);
+    return true;
 }
 
-constexpr size_t k_max_msg = 4096;
-
-static int one_request(int connfd)
+static void handle_write(Conn *conn)
 {
-    char rbuf[4 + k_max_msg];
-    errno = 0;
-    int err = read_all(connfd, rbuf, 4);
-    if(err)
+    assert(conn->outgoing.size() > 0);
+    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+    if(rv < 0)
     {
-        if(errno == 0)
-            std::cerr << "ERROR: EOF\n";
-        else
-            std::cerr << "ERROR: could not read from socket: " 
-                      << strerror(errno) 
-                      << "\n";
-        return err;
+        if(errno == EAGAIN) return;
+        conn->want_close = true;
+        return;
     }
-    unsigned int len = 0;
-    memcpy(&len, rbuf, sizeof(unsigned int)); // assume little endian
-    if(len > k_max_msg)
+    buf_consume(conn->outgoing, (size_t)rv);
+    if(conn->outgoing.size() == 0)
     {
-        std::cerr << "ERROR: message too long\n";
-        return 1;
+        conn->want_read = true;
+        conn->want_write = false;
     }
-    err = read_all(connfd, &rbuf[4], len);
-    if(err)
-    {
-        std::cerr << "ERROR: could not read message\n";
-        return 1;
-    }
-    printf("client says: %.*s\n", len, &rbuf[4]);
+}
 
-    const char reply[] = "world";
-    char wbuf[4 + sizeof(reply)];
-    len = (unsigned int)strlen(reply);
-    memcpy(wbuf, &len, sizeof(unsigned int));
-    memcpy(&wbuf[4], reply, len);
-    return write_all(connfd, wbuf, 4 + len);
+
+static void handle_read(Conn *conn)
+{
+    uint8_t buf[64 * 1024];
+    ssize_t rv = read(conn->fd, buf, sizeof(buf));
+    if(rv <= 0)
+    {
+        conn->want_close = true;
+        return;
+    }
+    buf_append(conn->incoming, buf, (size_t)rv);
+    while(try_one_request(conn));
+    if(conn->outgoing.size() > 0)
+    {
+        conn->want_read = false;
+        conn->want_write = true;
+        return handle_write(conn);
+    }
+}
+
+static Conn *handle_accept(int fd)
+{
+    struct sockaddr_in client_addr = {};
+    socklen_t addrlen = sizeof(client_addr);
+    int connfd = accept(fd, (struct sockaddr*)&client_addr, &addrlen);
+    if(connfd < 0) return NULL;
+    fd_set_nb(connfd);
+    Conn *conn = new Conn();
+    conn->fd = connfd;
+    conn->want_read = true;
+    return conn;
 }
 
 int main(void)
@@ -120,25 +246,63 @@ int main(void)
         return 1;
     }
     std::cout << "Listening on 0.0.0.0:1234\n";
+
+    std::vector<Conn*> fd2conn;
+    std::vector<struct pollfd> poll_args;
+    fd_set_nb(fd);
     while(true)
     {
-        struct sockaddr_in client_addr = {};
-        socklen_t addrlen = sizeof(client_addr);
-        int connfd = accept(fd, (struct sockaddr *)&client_addr, &addrlen);
-        if(connfd < 0)
+        poll_args.clear();
+        struct pollfd pfd = {fd, POLLIN, 0};
+        poll_args.push_back(pfd);
+        for(Conn *conn: fd2conn)
         {
-            std::cerr << "ERROR: could not accept connection: " 
-                      << strerror(errno) 
+            if(!conn)
+            {
+                continue;
+            }
+            struct pollfd pfd = {conn->fd, POLLERR, 0};
+            if(conn->want_read)
+            {
+                pfd.events |= POLLIN;
+            }
+            if(conn->want_write)
+            {
+                pfd.events |= POLLOUT;
+            }
+            poll_args.push_back(pfd);
+        }
+        int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), -1);
+        if(rv < 0 && errno == EINTR) continue;
+        if(rv < 0)
+        {
+            std::cerr << "ERROR: could not poll events"
+                      << strerror(errno)
                       << "\n";
-            continue;
+            return 1;
         }
-        while(true)
+        if(poll_args[0].revents)
         {
-            int err = one_request(connfd);
-            if(err) break;
+            if(Conn *conn = handle_accept(fd))
+            {
+                if(fd2conn.size() <= (size_t)conn->fd)
+                    fd2conn.resize(conn->fd + 1);
+                fd2conn[conn->fd] = conn;
+            }
         }
-        close(connfd);
+        for(size_t i = 1; i < poll_args.size(); ++i)
+        {
+            int ready = poll_args[i].revents;
+            Conn *conn = fd2conn[poll_args[i].fd];
+            if(ready & POLLIN)  handle_read(conn);
+            if(ready & POLLOUT) handle_write(conn);
+            if(ready & POLLERR || conn->want_close)
+            {
+                (void)close(conn->fd);
+                fd2conn[conn->fd] = NULL;
+                delete conn;
+            }
+        }
     }
-    close(fd);
     return 0;
 }
